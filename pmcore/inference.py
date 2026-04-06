@@ -185,10 +185,15 @@ class ModelLoader:
         print(f"  Loading {component} from {ckpt_path}...")
         t0 = time.time()
 
-        model = builders[component]()
-        tok   = self.get_tokenizer()
-
+        tok  = self.get_tokenizer()
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+        # Use config stored in checkpoint when available (handles models trained
+        # with different dimensions than the factory default)
+        if "config" in ckpt and ckpt["config"] is not None:
+            model = PMCoreModel(ckpt["config"])
+        else:
+            model = builders[component]()
 
         # Always match vocab to checkpoint — single source of truth
         import torch.nn as nn

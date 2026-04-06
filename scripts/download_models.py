@@ -32,7 +32,7 @@ def download_pt_model(repo_id: str, filename: str, dest_path: Path, token: str =
         print(f"  Already exists: {dest_path}")
         return
 
-    print(f"  Downloading {repo_id}/{filename} → {dest_path} ...")
+    print(f"  Downloading {repo_id}/{filename} -> {dest_path} ...")
     local = hf_hub_download(
         repo_id=repo_id,
         filename=filename,
@@ -43,7 +43,7 @@ def download_pt_model(repo_id: str, filename: str, dest_path: Path, token: str =
     downloaded = Path(local)
     if downloaded != dest_path:
         downloaded.rename(dest_path)
-    print(f"  ✓ Saved to {dest_path}")
+    print(f"  OK Saved to {dest_path}")
 
 
 def download_hf_model(repo_id: str, dest_dir: Path, token: str = None):
@@ -61,14 +61,14 @@ def download_hf_model(repo_id: str, dest_dir: Path, token: str = None):
         print(f"  Already exists: {dest_dir}")
         return
 
-    print(f"  Downloading {repo_id} → {dest_dir} ...")
+    print(f"  Downloading {repo_id} -> {dest_dir} ...")
     snapshot_download(
         repo_id=repo_id,
         local_dir=str(dest_dir),
         token=token,
         ignore_patterns=["*.msgpack", "flax_model*", "tf_model*", "rust_model*"],
     )
-    print(f"  ✓ Saved to {dest_dir}")
+    print(f"  OK Saved to {dest_dir}")
 
 
 def main():
@@ -111,20 +111,29 @@ def main():
         token=token,
     )
 
-    # --- PMCommunicator ---
+    # --- PMCommunicator (from-scratch 746M, pipeline model) ---
+    print("3/3  PMCommunicator (746M from-scratch, ~1.4GB)...")
+    download_pt_model(
+        repo_id=f"{org}/pmcommunicator-pt",
+        filename="best.pt",
+        dest_path=checkpoints / "communicator" / "best.pt",
+        token=token,
+    )
+
+    # --- PMCommunicator Phi-3.5 LoRA (optional, for Ollama / enhanced comms) ---
     if not args.skip_communicator:
-        print("3/3  PMCommunicator (Phi-3.5-mini LoRA merged, ~3.8B)...")
-        print("     This is a large download (~7GB). Grab a coffee.")
+        print("4/4  PMCommunicator-Phi (Phi-3.5-mini LoRA merged, ~7GB)...")
+        print("     Large download. Only needed for Ollama / enhanced mode.")
         download_hf_model(
             repo_id=f"{org}/pmcommunicator",
             dest_dir=checkpoints / "communicator_phi3" / "merged",
             token=token,
         )
     else:
-        print("3/3  PMCommunicator skipped (--skip-communicator).")
+        print("4/4  PMCommunicator-Phi skipped (--skip-communicator).")
 
     print()
-    print("✓ All models downloaded. You can now start PMCore:")
+    print("OK All models downloaded. You can now start PMCore:")
     print("  uvicorn api:app --host 0.0.0.0 --port 8765")
     print("  or: docker compose up")
 
