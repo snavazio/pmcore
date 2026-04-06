@@ -115,3 +115,10 @@ eval_report_v6.md
 eval_report_*.md
 sample_outputs_report.md
 PROJECT_BRIEF.md
+
+# -----------------------------------------------------------------------------
+# Web UI build artifacts
+# -----------------------------------------------------------------------------
+web/node_modules/
+web/dist/
+web/package-lock.json
