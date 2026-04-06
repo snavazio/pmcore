@@ -1,0 +1,1066 @@
+"""
+PMCore Inference Engine
+=======================
+Chains PMPlanner → PMReasoner → PMCommunicator into a single pipeline.
+
+JSON Output Strategy:
+  1. JSON prefix injection — prompt ends with opening JSON so the model
+     is forced to complete a structure, not prose.
+  2. JSON repair — closes truncated braces, fixes trailing commas, etc.
+  3. Entity extraction fallback — regex pulls values from hallucinated
+     prose and builds a valid JSON structure.
+
+Usage:
+    from pmcore.inference import PMCorePipeline
+    pipeline = PMCorePipeline()
+    result = pipeline.run("Plan a hotel renovation with a 12-week deadline.")
+    print(result)
+"""
+
+import os
+import json
+import time
+import re
+import torch
+import torch.nn.functional as F
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional
+from transformers import AutoTokenizer
+
+from pmcore.model import (
+    PMCoreModel,
+    build_pmplanner,
+    build_pmreasoner,
+    build_pmcommunicator,
+    ModelConfig,
+)
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+CHECKPOINT_DIR      = Path("./checkpoints")
+PHI3_CHECKPOINT_DIR = Path("./checkpoints/communicator_phi3/merged")
+TOKENIZER_PATH      = "/home/snavazio/autoresearch-v2/pm-model"
+TOKENIZER_HF        = "hf-internal-testing/llama-tokenizer"
+
+SPECIAL_TOKENS = [
+    "<|pm_request|>",
+    "<|task_graph|>",
+    "<|analysis|>",
+    "<|communication|>",
+    "<|project_context|>",
+    "<|end|>",
+]
+
+# System prompt used during Phi-3.5 LoRA fine-tuning — must match exactly
+PHI3_SYSTEM_PROMPT = (
+    "You are PMCommunicator, an expert project manager and communications specialist. "
+    "Generate professional, stakeholder-ready project communications based on the provided "
+    "project context. Be specific — use the actual project name, numbers, and timeline. "
+    "Write in clear business English. Output only the communication document itself."
+)
+
+# ── Generation Config ─────────────────────────────────────────────────────────
+
+@dataclass
+class GenerationConfig:
+    max_new_tokens:     int   = 512
+    min_new_tokens:     int   = 32    # Prevents early { } collapse
+    temperature:        float = 0.7
+    top_p:              float = 0.9
+    top_k:              int   = 50
+    repetition_penalty: float = 1.1
+    do_sample:          bool  = True
+
+
+# ── Token Generation ──────────────────────────────────────────────────────────
+
+def generate(
+    model: PMCoreModel,
+    input_ids: torch.Tensor,
+    tokenizer,
+    config: GenerationConfig,
+    stop_token_id: Optional[int] = None,
+) -> str:
+    """Autoregressive token generation with sampling."""
+    model.eval()
+    device = next(model.parameters()).device
+
+    generated  = input_ids.clone().to(device)
+    past_kvs   = None
+    new_tokens = []
+    token_counts = {}
+
+    with torch.no_grad():
+        for step in range(config.max_new_tokens):
+            # Always pass full sequence — KV-cache shortcut is broken because
+            # RoPE uses T (current input length) for positions, so single-token
+            # steps always get position 0 instead of their actual position.
+            # Full-sequence recompute is correct and fast enough for our sizes.
+            logits, _ = model(generated)
+
+            next_logits = logits[:, -1, :]
+
+            # Repetition penalty
+            if config.repetition_penalty != 1.0:
+                for tid, count in token_counts.items():
+                    penalty = config.repetition_penalty ** count
+                    if next_logits[0, tid] > 0:
+                        next_logits[0, tid] /= penalty
+                    else:
+                        next_logits[0, tid] *= penalty
+
+            # Temperature + sampling
+            if config.temperature > 0 and config.do_sample:
+                next_logits = next_logits / config.temperature
+
+                if config.top_k > 0:
+                    topk_vals, _ = torch.topk(next_logits, config.top_k)
+                    min_val = topk_vals[:, -1].unsqueeze(-1)
+                    next_logits = next_logits.masked_fill(next_logits < min_val, float('-inf'))
+
+                if config.top_p < 1.0:
+                    sorted_logits, sorted_idx = torch.sort(next_logits, descending=True)
+                    cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    remove_mask = cum_probs - F.softmax(sorted_logits, dim=-1) > config.top_p
+                    sorted_logits[remove_mask] = float('-inf')
+                    next_logits = torch.zeros_like(next_logits).scatter_(1, sorted_idx, sorted_logits)
+
+                probs = F.softmax(next_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = next_logits.argmax(dim=-1, keepdim=True)
+
+            tid = next_token.item()
+            token_counts[tid] = token_counts.get(tid, 0) + 1
+
+            generated = torch.cat([generated, next_token], dim=1)
+            new_tokens.append(tid)
+
+            # Enforce minimum output before stopping
+            if len(new_tokens) < config.min_new_tokens:
+                continue
+
+            if stop_token_id and tid == stop_token_id:
+                break
+            if tokenizer.eos_token_id and tid == tokenizer.eos_token_id:
+                break
+
+            # Loop detection — stop if any single token repeats 4+ times in
+            # the last 12 tokens, or any bigram repeats 3+ times in the last 12.
+            if len(new_tokens) >= 12:
+                window = new_tokens[-12:]
+                # Single-token run
+                if any(window.count(t) >= 4 for t in set(window)):
+                    break
+                # Bigram repetition
+                bigrams = [(window[i], window[i+1]) for i in range(len(window)-1)]
+                if any(bigrams.count(bg) >= 3 for bg in set(bigrams)):
+                    break
+
+    raw = tokenizer.decode(new_tokens, skip_special_tokens=False)
+    # Strip any trailing garbage after loop-detection cutoff — find last sentence end
+    for end_char in ('\n\n', '.\n', '. ', '!\n', '?\n'):
+        idx = raw.rfind(end_char)
+        if idx > len(raw) // 3:   # at least past the first third
+            return raw[:idx + len(end_char)]
+    return raw
+
+
+# ── Model Loader ──────────────────────────────────────────────────────────────
+
+class ModelLoader:
+    """Loads and caches PMCore models."""
+
+    def __init__(self, device: str = "cuda"):
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.dtype  = torch.bfloat16
+        self._models = {}
+        self._tokenizer = None
+        self._phi3_model = None
+        self._phi3_tokenizer = None
+
+    def has_phi3_communicator(self) -> bool:
+        """True if the merged Phi-3.5 communicator checkpoint is present."""
+        return (PHI3_CHECKPOINT_DIR / "config.json").exists()
+
+    def load_phi3_communicator(self):
+        """Load (and cache) the fine-tuned Phi-3.5 communicator model."""
+        if self._phi3_model is not None:
+            return self._phi3_model, self._phi3_tokenizer
+
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        print(f"  Loading Phi-3.5 communicator from {PHI3_CHECKPOINT_DIR}...")
+        t0 = time.time()
+        self._phi3_tokenizer = AutoTokenizer.from_pretrained(str(PHI3_CHECKPOINT_DIR))
+        self._phi3_model = AutoModelForCausalLM.from_pretrained(
+            str(PHI3_CHECKPOINT_DIR),
+            torch_dtype=self.dtype,
+            attn_implementation="eager",
+        ).to(self.device)
+        self._phi3_model.eval()
+        elapsed = time.time() - t0
+        params  = sum(p.numel() for p in self._phi3_model.parameters())
+        print(f"  Phi-3.5 communicator loaded in {elapsed:.1f}s ({params/1e9:.2f}B params)")
+        return self._phi3_model, self._phi3_tokenizer
+
+    def get_tokenizer(self):
+        if self._tokenizer is None:
+            for src in [TOKENIZER_PATH, TOKENIZER_HF]:
+                try:
+                    tok = AutoTokenizer.from_pretrained(src)
+                    tok.add_special_tokens({"additional_special_tokens": SPECIAL_TOKENS})
+                    if tok.pad_token is None:
+                        tok.pad_token = tok.eos_token
+                    self._tokenizer = tok
+                    print(f"  Tokenizer: {src}")
+                    break
+                except Exception:
+                    continue
+        return self._tokenizer
+
+    def load_model(self, component: str) -> PMCoreModel:
+        if component in self._models:
+            return self._models[component]
+
+        builders = {
+            "planner":      build_pmplanner,
+            "reasoner":     build_pmreasoner,
+            "communicator": build_pmcommunicator,
+        }
+
+        ckpt_path = CHECKPOINT_DIR / component / "best.pt"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+        print(f"  Loading {component} from {ckpt_path}...")
+        t0 = time.time()
+
+        model = builders[component]()
+        tok   = self.get_tokenizer()
+
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+        # Always match vocab to checkpoint — single source of truth
+        import torch.nn as nn
+        ckpt_vocab = ckpt["model"]["embed.weight"].shape[0]
+        if ckpt_vocab != model.config.vocab_size:
+            model.embed   = nn.Embedding(ckpt_vocab, model.config.hidden_size)
+            model.lm_head = nn.Linear(model.config.hidden_size, ckpt_vocab, bias=False)
+            model.config.vocab_size = ckpt_vocab
+            if model.config.tie_embeddings:
+                model.lm_head.weight = model.embed.weight
+
+        model.load_state_dict(ckpt["model"])
+        model = model.to(self.device, dtype=self.dtype)
+        model.eval()
+
+        elapsed = time.time() - t0
+        print(f"  {component} loaded in {elapsed:.1f}s ({model.count_params()/1e6:.1f}M params)")
+
+        self._models[component] = model
+        return model
+
+    def load_all(self):
+        self.get_tokenizer()
+        self.load_model("planner")
+        self.load_model("reasoner")
+        if self.has_phi3_communicator():
+            self.load_phi3_communicator()
+        else:
+            self.load_model("communicator")
+        return self
+
+
+# ── Result Types ──────────────────────────────────────────────────────────────
+
+@dataclass
+class PlannerResult:
+    raw_output:    str
+    task_graph:    Optional[dict]
+    num_tasks:     int
+    methodology:   str
+    duration_days: int
+
+@dataclass
+class ReasonerResult:
+    raw_output:     str
+    risk_analysis:  Optional[dict]
+    overall_health: str
+    top_risks:      list
+    critical_path:  list
+
+@dataclass
+class CommunicatorResult:
+    raw_output:    str
+    communication: str
+    comm_type:     str
+
+@dataclass
+class PMCoreResult:
+    request:      str
+    planner:      PlannerResult
+    reasoner:     ReasonerResult
+    communicator: CommunicatorResult
+    latency_ms:   dict
+    total_ms:     float
+
+
+# ── JSON Recovery Stack ───────────────────────────────────────────────────────
+
+def _close_json(text: str) -> str:
+    """
+    Attempt to close an incomplete JSON string by counting open
+    brackets/braces and appending the correct closers.
+    """
+    stack = []
+    in_str = False
+    escape = False
+    for ch in text:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_str:
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch in '{[':
+            stack.append('}' if ch == '{' else ']')
+        elif ch in '}]':
+            if stack and stack[-1] == ch:
+                stack.pop()
+
+    # Remove trailing comma before closing
+    stripped = text.rstrip()
+    if stripped.endswith(','):
+        stripped = stripped[:-1]
+
+    return stripped + ''.join(reversed(stack))
+
+
+def repair_json(text: str) -> Optional[dict]:
+    """
+    Multi-strategy JSON recovery:
+      1. Direct parse
+      2. Extract largest JSON block and direct parse
+      3. Close truncated JSON and parse
+      4. json_repair library (if installed)
+    Returns parsed dict/list, or None if all strategies fail.
+    """
+    # Strategy 1: direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Strategy 2: find the largest {...} or [...] block
+    for pattern in [r'\{[\s\S]*\}', r'\[[\s\S]*\]']:
+        matches = re.findall(pattern, text)
+        for m in sorted(matches, key=len, reverse=True):
+            try:
+                return json.loads(m)
+            except Exception:
+                pass
+            # Strategy 3: close truncated block
+            try:
+                closed = _close_json(m)
+                return json.loads(closed)
+            except Exception:
+                pass
+
+    # Strategy 4: json_repair (pip install json-repair)
+    try:
+        import json_repair
+        result = json_repair.repair(text)
+        if isinstance(result, (dict, list)):
+            return result
+        parsed = json.loads(result)
+        return parsed
+    except Exception:
+        pass
+
+    return None
+
+
+def extract_entities_from_text(text: str) -> dict:
+    """
+    Last-resort extraction: pull structured values from hallucinated prose
+    using regex and keyword heuristics.
+    """
+    entities = {
+        "duration_days": 0,
+        "budget": None,
+        "methodology": "Hybrid",
+        "tasks": [],
+        "risks": [],
+        "phases": [],
+    }
+
+    # Duration
+    dur_match = re.search(
+        r'(\d+)\s*(?:-\s*\d+\s*)?(?:week|wk|day|month)',
+        text, re.IGNORECASE
+    )
+    if dur_match:
+        val = int(dur_match.group(1))
+        unit = dur_match.group(0).lower()
+        if 'week' in unit or 'wk' in unit:
+            entities["duration_days"] = val * 7
+        elif 'month' in unit:
+            entities["duration_days"] = val * 30
+        else:
+            entities["duration_days"] = val
+
+    # Budget
+    bud_match = re.search(
+        r'\$\s*([\d,]+(?:\.\d+)?)\s*([MBKk])?',
+        text
+    )
+    if bud_match:
+        raw = float(bud_match.group(1).replace(',', ''))
+        mult = {'M': 1_000_000, 'B': 1_000_000_000, 'K': 1_000, 'k': 1_000}.get(
+            bud_match.group(2) or '', 1
+        )
+        entities["budget"] = int(raw * mult)
+
+    # Methodology
+    for meth in ["Agile", "Scrum", "Waterfall", "PRINCE2", "Kanban", "Hybrid", "PMP"]:
+        if meth.lower() in text.lower():
+            entities["methodology"] = meth
+            break
+
+    # Task-like sentences (numbered lists, bullets)
+    task_lines = re.findall(
+        r'(?:^\d+\.\s+|^[-•]\s+|(?:phase|task|step)\s+\d+[:.]?\s+)(.+)',
+        text, re.MULTILINE | re.IGNORECASE
+    )
+    entities["tasks"] = [t.strip()[:80] for t in task_lines[:12]]
+
+    # Risk keywords
+    risk_kws = [
+        "schedule", "budget", "scope", "resource", "technical", "vendor",
+        "regulatory", "weather", "supply chain", "stakeholder", "quality",
+    ]
+    found_risks = [kw for kw in risk_kws if kw in text.lower()]
+    entities["risks"] = found_risks[:5]
+
+    return entities
+
+
+def derive_project_name(request: str) -> str:
+    """Extract a meaningful project name from a free-text request string."""
+    r = request.strip()
+
+    # Pattern 1: verb + explicit object — "Plan a hotel lobby renovation"
+    m = re.search(
+        r'(?:plan|design|build|develop|deliver|execute|manage|complete|implement|perform|create|initiate)\s+'
+        r'(?:a\s+|an\s+|the\s+)?([A-Za-z][A-Za-z0-9 &\'\-]{4,70}?)(?:\.|,|with\s|for\s|\n|$|\Z)',
+        r, re.IGNORECASE
+    )
+    if m:
+        cand = m.group(1).strip().title()
+        if cand.lower() not in ("project", "plan", "work", "it", "this"):
+            return cand
+
+    # Pattern 2: explicit "<X> project/renovation/upgrade/etc." descriptor
+    m = re.search(
+        r'([A-Za-z][A-Za-z0-9 &\'\-]{3,60}'
+        r'(?:project|renovation|upgrade|build-out|expansion|retrofit|replacement|'
+        r'installation|implementation|overhaul|rollout|remodel|conversion|refresh|'
+        r'compliance|modernization|migration|deployment|integration))',
+        r, re.IGNORECASE
+    )
+    if m:
+        return m.group(1).strip().title()
+
+    # Pattern 3: "for a/the <noun phrase>"
+    m = re.search(r'for\s+(?:a\s+|an\s+|the\s+)?([A-Za-z][^.!?\n]{5,60}?)(?:\.|,|\n|$)', r, re.IGNORECASE)
+    if m:
+        cand = m.group(1).strip().title()
+        if cand.lower() not in ("project", "plan", "work"):
+            return cand
+
+    # Pattern 4: first noun phrase (drop leading imperative verbs/articles)
+    first_phrase = re.split(r'[.,!?\n]', r)[0].strip()
+    words = first_phrase.split()
+    drop = {"plan", "create", "build", "design", "develop", "execute", "manage",
+            "deliver", "implement", "do", "make", "complete", "run", "write",
+            "draft", "a", "an", "the", "please", "i", "we", "need", "to"}
+    while words and words[0].lower() in drop:
+        words = words[1:]
+    cand = " ".join(words[:7]).strip(". ,").title()
+    if len(cand) >= 6 and cand.lower() not in ("project", "plan", "work"):
+        return cand
+
+    return "Unnamed Project"
+
+
+def build_planner_json(request: str, entities: dict, raw_text: str) -> dict:
+    """
+    Build a minimal valid PMPlanner JSON from extracted entities
+    when the model fails to output structured JSON.
+    """
+    proj_name = derive_project_name(request)
+
+    tasks = []
+    if entities["tasks"]:
+        for i, t in enumerate(entities["tasks"], 1):
+            tasks.append({
+                "id": f"T{i:02d}",
+                "name": t,
+                "duration_days": max(3, entities["duration_days"] // max(len(entities["tasks"]), 1)),
+                "dependencies": [f"T{i-1:02d}"] if i > 1 else [],
+                "owner": "Project Team",
+                "phase": "Execution",
+                "status": "not_started",
+            })
+    else:
+        # Minimal generic breakdown
+        generic_phases = [
+            ("Initiation & Planning", 14),
+            ("Design & Procurement", 21),
+            ("Execution", max(14, entities["duration_days"] - 42)),
+            ("Testing & Handover", 7),
+        ]
+        for i, (name, dur) in enumerate(generic_phases, 1):
+            tasks.append({
+                "id": f"T{i:02d}",
+                "name": name,
+                "duration_days": dur,
+                "dependencies": [f"T{i-1:02d}"] if i > 1 else [],
+                "owner": "Project Manager",
+                "phase": name.split("&")[0].strip(),
+                "status": "not_started",
+            })
+
+    return {
+        "project": {
+            "name": proj_name,
+            "description": request[:200],
+            "methodology": entities["methodology"],
+            "estimated_duration_days": entities["duration_days"] or sum(t["duration_days"] for t in tasks),
+            "budget_usd": entities["budget"],
+            "status": "planning",
+        },
+        "tasks": tasks,
+        "_fallback": True,
+        "_note": "Structured fallback — model output was unstructured prose.",
+    }
+
+
+def build_reasoner_json(request: str, entities: dict, planner: "PlannerResult") -> dict:
+    """
+    Build a minimal valid PMReasoner JSON from extracted entities.
+    """
+    task_names = []
+    if planner.task_graph and "tasks" in planner.task_graph:
+        task_names = [t.get("name", "") for t in planner.task_graph["tasks"][:6]]
+
+    risk_map = {
+        "schedule": ("Schedule Delay", "medium", "Add buffer and monitor velocity weekly"),
+        "budget":   ("Budget Overrun", "high", "Implement EVM and review costs bi-weekly"),
+        "scope":    ("Scope Creep", "medium", "Enforce change control board approval"),
+        "resource": ("Resource Availability", "medium", "Identify backups and cross-train"),
+        "vendor":   ("Vendor/Supply Chain Risk", "medium", "Qualify alternate suppliers"),
+        "regulatory": ("Regulatory/Permit Risk", "high", "Engage authorities in phase 1"),
+        "technical": ("Technical Complexity", "medium", "Prototype critical components early"),
+        "stakeholder": ("Stakeholder Alignment", "low", "Weekly status reports and sign-offs"),
+        "quality": ("Quality Defects", "medium", "Define QA checkpoints at each phase gate"),
+    }
+
+    risks = []
+    for kw in entities["risks"]:
+        if kw in risk_map:
+            rtype, severity, mitigation = risk_map[kw]
+            risks.append({
+                "type": rtype,
+                "severity": severity,
+                "probability": "medium",
+                "mitigation": mitigation,
+            })
+
+    if not risks:
+        risks = [
+            {"type": "Schedule Delay", "severity": "medium", "probability": "medium",
+             "mitigation": "Build 15% buffer and track weekly velocity"},
+            {"type": "Budget Overrun", "severity": "medium", "probability": "low",
+             "mitigation": "Baseline costs and review at each phase gate"},
+        ]
+
+    high_risks = [r for r in risks if r["severity"] == "high"]
+    health = "red" if len(high_risks) >= 2 else ("yellow" if risks else "green")
+
+    critical_tasks = task_names[:4] if task_names else ["Planning", "Procurement", "Execution", "Testing"]
+
+    return {
+        "overall_health": health,
+        "risks": risks,
+        "critical_path": {
+            "tasks": critical_tasks,
+            "total_duration_days": planner.duration_days or 0,
+            "float_days": max(0, (planner.duration_days or 30) // 10),
+        },
+        "constraints": [
+            f"Deadline: {planner.duration_days} days" if planner.duration_days else "Timeline TBD",
+            f"Budget: ${entities['budget']:,}" if entities.get("budget") else "Budget TBD",
+        ],
+        "recommendations": [
+            "Establish PMO governance structure before kickoff",
+            "Lock scope with signed charter before procurement",
+            "Weekly steering committee reviews during execution",
+        ],
+        "_fallback": True,
+        "_note": "Structured fallback — model output was unstructured prose.",
+    }
+
+
+# ── Output Cleaners & Parsers ─────────────────────────────────────────────────
+
+def clean_output(text: str) -> str:
+    """Remove special tokens from generated text."""
+    for token in SPECIAL_TOKENS:
+        text = text.replace(token, "")
+    return text.strip()
+
+
+def parse_planner_output(raw: str, request: str = "") -> "PlannerResult":
+    cleaned = clean_output(raw)
+    graph   = repair_json(cleaned)
+
+    if not graph or not isinstance(graph, dict):
+        # Full fallback
+        entities = extract_entities_from_text(request + " " + cleaned)
+        graph = build_planner_json(request, entities, cleaned)
+
+    num_tasks     = len(graph.get("tasks", []))
+    methodology   = graph.get("project", {}).get("methodology", "Hybrid")
+    duration_days = graph.get("project", {}).get("estimated_duration_days", 0)
+
+    # Patch missing duration from task sum
+    if not duration_days and graph.get("tasks"):
+        duration_days = sum(t.get("duration_days", 0) for t in graph["tasks"])
+        graph["project"]["estimated_duration_days"] = duration_days
+
+    # Patch generic/missing project name — model sometimes outputs "Project" literally
+    proj_name = graph.get("project", {}).get("name", "")
+    if not proj_name or proj_name.strip().lower() in ("project", "unnamed project", "untitled", ""):
+        if request:
+            graph.setdefault("project", {})["name"] = derive_project_name(request)
+
+    return PlannerResult(
+        raw_output=cleaned,
+        task_graph=graph,
+        num_tasks=num_tasks,
+        methodology=methodology,
+        duration_days=duration_days,
+    )
+
+
+def parse_reasoner_output(raw: str, request: str = "", planner: Optional["PlannerResult"] = None) -> "ReasonerResult":
+    cleaned  = clean_output(raw)
+    analysis = repair_json(cleaned)
+
+    if not analysis or not isinstance(analysis, dict):
+        entities = extract_entities_from_text(request + " " + cleaned)
+        from pmcore.inference import PlannerResult as _PR
+        dummy_planner = planner or PlannerResult(
+            raw_output="", task_graph=None, num_tasks=0,
+            methodology="Hybrid", duration_days=0
+        )
+        analysis = build_reasoner_json(request, entities, dummy_planner)
+
+    top_risks     = []
+    critical_path = []
+    health        = analysis.get("overall_health", "yellow")
+
+    risks_list = analysis.get("risks", [])
+    if isinstance(risks_list, list):
+        top_risks = [r.get("type", "") for r in risks_list[:3] if isinstance(r, dict)]
+
+    cp_data = analysis.get("critical_path", {})
+    if isinstance(cp_data, dict):
+        critical_path = cp_data.get("tasks", [])
+    elif isinstance(cp_data, list):
+        critical_path = cp_data
+
+    return ReasonerResult(
+        raw_output=cleaned,
+        risk_analysis=analysis,
+        overall_health=health,
+        top_risks=top_risks,
+        critical_path=critical_path,
+    )
+
+
+def _strip_placeholders(text: str) -> str:
+    """Remove common LLM placeholder patterns from generated prose."""
+    # Remove [Insert X], [X], {X} placeholders
+    text = re.sub(r'\[Insert [^\]]+\]', 'TBD', text)
+    text = re.sub(r'\[Your [^\]]+\]', 'TBD', text)
+    text = re.sub(r'\[Project [^\]]+\]', 'TBD', text)
+    text = re.sub(r'\[Name\]', 'Project Team', text)
+    text = re.sub(r'\[Date\]', '', text)
+    text = re.sub(r'\[XX\]', 'TBD', text)
+    # Clean up double spaces left behind
+    text = re.sub(r'  +', ' ', text)
+    return text.strip()
+
+
+def parse_communicator_output(raw: str) -> "CommunicatorResult":
+    cleaned = _strip_placeholders(clean_output(raw))
+    lower   = cleaned.lower()
+
+    # Extract first non-blank line (the document header) — most reliable signal
+    first_line = ""
+    for line in cleaned.splitlines():
+        if line.strip():
+            first_line = line.strip().lower()
+            break
+
+    # Priority order matters — check specific document headers first,
+    # then fall back to body-text signals.
+    comm_type = "project_update"
+
+    # Closeout / handover — check BEFORE email (handover letters start with "Dear")
+    if any(k in first_line for k in ("closeout", "close-out", "handover letter",
+                                      "lessons learned", "project completion")):
+        comm_type = "closeout_report"
+    elif "handover letter" in lower or "formal handover" in lower:
+        comm_type = "closeout_report"
+
+    # Kickoff — subject line or explicit header
+    elif "kickoff" in first_line or "kick-off" in first_line:
+        comm_type = "kickoff_email"
+    elif "subject:" in lower and ("kickoff" in lower or "kick-off" in lower):
+        comm_type = "kickoff_email"
+
+    # Risk escalation — title must say escalation, not just mention risk
+    elif any(k in first_line for k in ("escalation", "risk escalation", "urgent:")):
+        comm_type = "risk_escalation"
+    elif "escalation memo" in lower or "risk escalation" in lower:
+        comm_type = "risk_escalation"
+
+    # Board / executive
+    elif any(k in first_line for k in ("board update", "board memo", "executive summary",
+                                        "governance update")):
+        comm_type = "executive_summary"
+    elif "executive summary" in lower or "board update" in lower:
+        comm_type = "executive_summary"
+
+    # Weekly status report
+    elif any(k in first_line for k in ("weekly status", "status report", "project status")):
+        comm_type = "status_report"
+    elif "status report" in lower or "weekly status" in lower:
+        comm_type = "status_report"
+
+    # Generic email (kickoff already caught above)
+    elif "subject:" in lower or (lower.startswith("dear ") and "subject" not in lower):
+        comm_type = "email"
+
+    return CommunicatorResult(
+        raw_output=cleaned,
+        communication=cleaned,
+        comm_type=comm_type,
+    )
+
+
+# ── The Pipeline ──────────────────────────────────────────────────────────────
+
+class PMCorePipeline:
+    """
+    End-to-end PMCore inference pipeline.
+    PMPlanner → PMReasoner → PMCommunicator
+    """
+
+    def __init__(self, device: str = "cuda", preload: bool = True):
+        print("Initializing PMCore Pipeline...")
+        self.loader = ModelLoader(device)
+        self.gen_config = GenerationConfig()
+        if preload:
+            self.loader.load_all()
+        print("PMCore ready.\n")
+
+    def _encode(self, text: str) -> torch.Tensor:
+        tok = self.loader.get_tokenizer()
+        return tok.encode(text, return_tensors="pt")
+
+    def _run_planner(self, request: str) -> tuple[str, PlannerResult]:
+        """Stage 1: Generate structured task graph from PM request."""
+        tok   = self.loader.get_tokenizer()
+        model = self.loader.load_model("planner")
+
+        # Match exactly the format used during training:
+        # <|pm_request|>\n{input}\n<|response|>\n{output}<|end|>
+        prompt = (
+            f"<|pm_request|>\n{request}\n"
+            f"<|response|>\n"
+        )
+
+        # Find the <|end|> token id to use as stop token
+        end_token_id = tok.convert_tokens_to_ids("<|end|>")
+
+        cfg = GenerationConfig(
+            max_new_tokens=800,
+            min_new_tokens=100,
+            temperature=0.2,   # Very low — deterministic JSON
+            top_p=0.9,
+            top_k=20,          # Tight — stays on schema
+            repetition_penalty=1.3,  # Strong — kills looping
+        )
+
+        input_ids = self._encode(prompt)
+        raw = generate(model, input_ids, tok, cfg,
+                       stop_token_id=end_token_id)
+        result = parse_planner_output(raw, request)
+        return prompt, result
+
+    def _run_reasoner(self, request: str, planner_result: PlannerResult) -> tuple[str, ReasonerResult]:
+        """Stage 2: JSON prefix injection forces risk analysis structure."""
+        tok   = self.loader.get_tokenizer()
+        model = self.loader.load_model("reasoner")
+
+        task_graph_str = (
+            json.dumps(planner_result.task_graph, indent=2)
+            if planner_result.task_graph
+            else planner_result.raw_output[:600]
+        )
+
+        prompt = (
+            f"<|pm_request|>\n"
+            f"Analyze the risks, critical path, and constraints for this project:\n{request}\n"
+            f"<|task_graph|>\n{task_graph_str}\n"
+            f"<|response|>\n"
+        )
+
+        end_token_id = tok.convert_tokens_to_ids("<|end|>")
+
+        cfg = GenerationConfig(
+            max_new_tokens=700,
+            min_new_tokens=100,
+            temperature=0.2,
+            top_p=0.9,
+            top_k=20,
+            repetition_penalty=1.3,
+        )
+
+        input_ids = self._encode(prompt)
+        raw = generate(model, input_ids, tok, cfg,
+                       stop_token_id=end_token_id)
+        result = parse_reasoner_output(raw, request, planner_result)
+        return prompt, result
+
+    def _build_communicator_context(
+        self,
+        request: str,
+        planner_result: PlannerResult,
+        reasoner_result: ReasonerResult,
+    ) -> dict:
+        """Build the context dict shared by both communicator backends."""
+        proj      = (planner_result.task_graph or {}).get("project", {})
+        proj_name = proj.get("name", "") or derive_project_name(request)
+        budget    = proj.get("budget_usd", 0)
+        # If planner didn't extract a budget, try to parse one from the raw request
+        if not budget:
+            m = re.search(r'\$\s*(\d+(?:\.\d+)?)\s*(B|M|K)?', request, re.I)
+            if m:
+                val = float(m.group(1))
+                suffix = (m.group(2) or "").upper()
+                budget = int(val * {"B": 1_000_000_000, "M": 1_000_000, "K": 1_000}.get(suffix, 1))
+        ev        = (reasoner_result.risk_analysis or {}).get("earned_value", {})
+        return {
+            "project_name":         proj_name,
+            "project_summary":      request,
+            "methodology":          planner_result.methodology,
+            "duration_days":        planner_result.duration_days,
+            "budget_usd":           budget,
+            "health":               reasoner_result.overall_health.upper(),
+            "status":               "planning",
+            "pct_complete":         0,
+            "spi":                  ev.get("spi", 1.0),
+            "cpi":                  ev.get("cpi", 1.0),
+            "budget_spent_usd":     0,
+            "top_risks":            reasoner_result.top_risks,
+            "critical_path_phases": reasoner_result.critical_path,
+        }
+
+    def _run_communicator(
+        self,
+        request: str,
+        planner_result: PlannerResult,
+        reasoner_result: ReasonerResult,
+        comm_request: str = "Write a project kickoff summary for stakeholders.",
+    ) -> tuple[str, CommunicatorResult]:
+        """
+        Stage 3: Stakeholder-facing prose generation.
+        Prefers fine-tuned Phi-3.5 (checkpoints/communicator_phi3/merged/) when
+        available; falls back to the custom 672M PMCommunicator otherwise.
+        """
+        if self.loader.has_phi3_communicator():
+            return self._run_communicator_phi3(request, planner_result, reasoner_result, comm_request)
+        return self._run_communicator_custom(request, planner_result, reasoner_result, comm_request)
+
+    def _run_communicator_phi3(
+        self,
+        request: str,
+        planner_result: PlannerResult,
+        reasoner_result: ReasonerResult,
+        comm_request: str,
+    ) -> tuple[str, CommunicatorResult]:
+        """Phi-3.5-mini fine-tuned communicator — high-quality prose via HF generate()."""
+        model, phi3_tok = self.loader.load_phi3_communicator()
+        context         = self._build_communicator_context(request, planner_result, reasoner_result)
+        context_str     = json.dumps(context, indent=2)
+
+        # Detect document type from comm_request to give model an explicit starter.
+        # This prevents defaulting to kickoff emails for all communication types.
+        _req_lower = comm_request.lower()
+        if any(k in _req_lower for k in ("closeout", "close-out", "handover", "lessons learned")):
+            doc_starter = "PROJECT CLOSEOUT REPORT\n"
+        elif any(k in _req_lower for k in ("escalat", "urgent")):
+            doc_starter = "RISK ESCALATION MEMO\n"
+        elif any(k in _req_lower for k in ("board", "executive summary", "governance")):
+            doc_starter = "EXECUTIVE SUMMARY\n"
+        elif any(k in _req_lower for k in ("status report", "weekly status", "progress update")):
+            doc_starter = "PROJECT STATUS REPORT\n"
+        elif any(k in _req_lower for k in ("kickoff", "kick-off", "launch announcement")):
+            doc_starter = "Subject: Project Kickoff —"
+        else:
+            doc_starter = ""   # let model decide
+
+        # Must match the chat template used during LoRA fine-tuning exactly
+        user_msg = f"{comm_request}\n\nProject Context:\n{context_str}"
+        prompt   = (
+            f"<|system|>\n{PHI3_SYSTEM_PROMPT}<|end|>\n"
+            f"<|user|>\n{user_msg}<|end|>\n"
+            f"<|assistant|>\n{doc_starter}"
+        )
+
+        input_ids = phi3_tok.encode(prompt, return_tensors="pt").to(
+            next(model.parameters()).device
+        )
+
+        with torch.no_grad():
+            output_ids = model.generate(
+                input_ids,
+                max_new_tokens=500,
+                min_new_tokens=60,
+                do_sample=True,
+                temperature=0.3,
+                top_p=0.92,
+                top_k=20,
+                repetition_penalty=1.1,
+                pad_token_id=phi3_tok.eos_token_id,
+                eos_token_id=phi3_tok.convert_tokens_to_ids("<|end|>"),
+            )
+
+        # Decode only the newly generated tokens
+        new_ids = output_ids[0][input_ids.shape[1]:]
+        raw     = phi3_tok.decode(new_ids, skip_special_tokens=True).strip()
+        result  = parse_communicator_output(raw)
+        return prompt, result
+
+    def _run_communicator_custom(
+        self,
+        request: str,
+        planner_result: PlannerResult,
+        reasoner_result: ReasonerResult,
+        comm_request: str,
+    ) -> tuple[str, CommunicatorResult]:
+        """Fallback: custom 672M PMCommunicator (from-scratch transformer)."""
+        tok     = self.loader.get_tokenizer()
+        model   = self.loader.load_model("communicator")
+        context = self._build_communicator_context(request, planner_result, reasoner_result)
+
+        # Prompt format matches communicator_clean_corpus.jsonl training data
+        prompt = (
+            f"<|pm_request|>\n{comm_request}\n"
+            f"<|project_context|>\n{json.dumps(context, indent=2)}\n"
+            f"<|response|>\n"
+        )
+
+        end_token_id = tok.convert_tokens_to_ids("<|end|>")
+        cfg = GenerationConfig(
+            max_new_tokens=500,
+            min_new_tokens=60,
+            temperature=0.3,
+            top_p=0.92,
+            top_k=20,
+            repetition_penalty=1.3,
+        )
+
+        input_ids = self._encode(prompt)
+        raw       = generate(model, input_ids, tok, cfg, stop_token_id=end_token_id)
+        result    = parse_communicator_output(raw)
+        return prompt, result
+
+    def run(
+        self,
+        request: str,
+        comm_request: str = "Write a professional project kickoff summary for stakeholders.",
+        verbose: bool = True,
+    ) -> PMCoreResult:
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"PMCore Pipeline")
+            print(f"Request: {request}")
+            print(f"{'='*60}")
+
+        latency = {}
+        t_total = time.time()
+
+        # ── Stage 1: PMPlanner ────────────────────────────────────────
+        if verbose: print("\n[Stage 1: PMPlanner — decomposing request...]")
+        t0 = time.time()
+        _, planner_result = self._run_planner(request)
+        latency["planner_ms"] = round((time.time() - t0) * 1000)
+
+        if verbose:
+            is_fallback = (planner_result.task_graph or {}).get("_fallback", False)
+            print(f"  Tasks: {planner_result.num_tasks}  {'(fallback)' if is_fallback else '(model JSON)'}")
+            print(f"  Methodology: {planner_result.methodology}")
+            print(f"  Duration: {planner_result.duration_days} days")
+            print(f"  Latency: {latency['planner_ms']}ms")
+
+        # ── Stage 2: PMReasoner ───────────────────────────────────────
+        if verbose: print("\n[Stage 2: PMReasoner — analyzing risks & critical path...]")
+        t0 = time.time()
+        _, reasoner_result = self._run_reasoner(request, planner_result)
+        latency["reasoner_ms"] = round((time.time() - t0) * 1000)
+
+        if verbose:
+            is_fallback = (reasoner_result.risk_analysis or {}).get("_fallback", False)
+            print(f"  Health: {reasoner_result.overall_health.upper()}  {'(fallback)' if is_fallback else '(model JSON)'}")
+            print(f"  Top risks: {', '.join(reasoner_result.top_risks[:3]) or 'none identified'}")
+            print(f"  Critical path: {' → '.join(str(t) for t in reasoner_result.critical_path[:5]) or 'TBD'}")
+            print(f"  Latency: {latency['reasoner_ms']}ms")
+
+        # ── Stage 3: PMCommunicator ───────────────────────────────────
+        if verbose: print(f"\n[Stage 3: PMCommunicator — '{comm_request[:50]}...']")
+        t0 = time.time()
+        _, comm_result = self._run_communicator(request, planner_result, reasoner_result, comm_request)
+        latency["communicator_ms"] = round((time.time() - t0) * 1000)
+
+        latency["total_ms"] = round((time.time() - t_total) * 1000)
+
+        if verbose:
+            print(f"  Type: {comm_result.comm_type}")
+            print(f"  Latency: {latency['communicator_ms']}ms")
+            print(f"\nTotal pipeline latency: {latency['total_ms']}ms")
+            print(f"\n{'='*60}")
+            print("COMMUNICATION OUTPUT:")
+            print(f"{'='*60}")
+            print(comm_result.communication)
+            print(f"{'='*60}\n")
+
+        return PMCoreResult(
+            request=request,
+            planner=planner_result,
+            reasoner=reasoner_result,
+            communicator=comm_result,
+            latency_ms=latency,
+            total_ms=latency["total_ms"],
+        )

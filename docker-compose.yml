@@ -1,0 +1,40 @@
+services:
+  pmcore:
+    image: pmcore/pmcore:latest
+    build: .
+    container_name: pmcore
+    ports:
+      - "8765:8765"
+    volumes:
+      # Persist model weights — download once, reuse across restarts
+      - ./checkpoints:/app/checkpoints
+    environment:
+      # Set to 0 if you have pre-downloaded weights in ./checkpoints
+      PMCORE_AUTO_DOWNLOAD: "1"
+      PMCORE_HF_ORG: "pmcore"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+  # Optional: nginx reverse proxy with SSL (comment out if not needed)
+  # nginx:
+  #   image: nginx:alpine
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - ./ssl:/etc/nginx/ssl:ro
+  #   depends_on:
+  #     - pmcore
