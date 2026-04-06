@@ -3,6 +3,7 @@ import InputForm from './components/InputForm';
 import PlannerPanel from './components/PlannerPanel';
 import ReasonerPanel from './components/ReasonerPanel';
 import CommunicatorPanel from './components/CommunicatorPanel';
+import MathAuditPanel from './components/MathAuditPanel';
 import SettingsPanel from './components/SettingsPanel';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -42,10 +43,25 @@ export interface CommunicatorResult {
   subject?: string;
 }
 
+export interface MathCheck {
+  name: string;
+  status: 'pass' | 'warn' | 'fail' | 'skip';
+  message: string;
+  detail?: Record<string, unknown>;
+}
+
+export interface MathAuditResult {
+  overall: 'pass' | 'warn' | 'fail';
+  summary: string;
+  checks: MathCheck[];
+  corrections: Record<string, number>;
+}
+
 export interface PipelineResponse {
   planner: PlannerResult;
   reasoner: ReasonerResult;
   communicator: CommunicatorResult;
+  math_audit?: MathAuditResult;
 }
 
 export type LoadingState = 'idle' | 'loading' | 'success' | 'error';
@@ -141,7 +157,7 @@ export default function App() {
 
           <div className="flex items-center gap-2">
             <a
-              href="https://github.com"
+              href="https://github.com/snavazio/pmcore"
               target="_blank"
               rel="noopener noreferrer"
               className="btn-ghost text-slate-500 hover:text-slate-300"
@@ -196,8 +212,8 @@ export default function App() {
           isLoading={loadingState === 'loading'}
         />
 
-        {/* Three-panel output grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 flex-1 min-h-0">
+        {/* Four-panel output grid: 3 top + 1 math audit bottom-left */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <PlannerPanel
             data={result?.planner ?? null}
             isLoading={loadingState === 'loading'}
@@ -211,13 +227,20 @@ export default function App() {
             isLoading={loadingState === 'loading'}
           />
         </div>
+        {/* PMMath audit spans full width below the three panels */}
+        {(loadingState === 'loading' || result?.math_audit) && (
+          <MathAuditPanel
+            audit={result?.math_audit ?? null}
+            loading={loadingState === 'loading'}
+          />
+        )}
       </main>
 
       {/* ── Footer ── */}
       <footer className="border-t border-slate-800 bg-slate-900/50 py-3 px-6">
         <div className="max-w-[1600px] mx-auto">
           <p className="text-center text-xs text-slate-600 font-mono">
-            PMCore v6 · Models: PMPlanner 171.8M · PMReasoner 125.3M · PMCommunicator Phi-3.5 LoRA
+            PMCore v6 · PMPlanner 171.8M · PMReasoner 125.3M · PMCommunicator Phi-3.5 LoRA · PMMath Validator
           </p>
         </div>
       </footer>

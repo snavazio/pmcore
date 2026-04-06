@@ -55,6 +55,8 @@ app = FastAPI(
     description="Purpose-built AI Project Management reasoning engine",
     version="1.0.0",
     lifespan=lifespan,
+    docs_url="/live-docs",
+    redoc_url="/docs",
 )
 
 # Allow all origins (Tailscale LAN + WordPress)
@@ -109,11 +111,19 @@ class CommunicationResponse(BaseModel):
     comm_type:     str
 
 
+class MathAuditResponse(BaseModel):
+    overall:     str
+    summary:     str
+    checks:      list
+    corrections: dict
+
+
 class PlanResponse(BaseModel):
     request:       str
     planner:       TaskGraphResponse
     reasoner:      RiskResponse
     communicator:  CommunicationResponse
+    math_audit:    Optional[MathAuditResponse]
     latency_ms:    dict
     total_ms:      float
     model_version: str = "PMCore v1.0"
@@ -211,6 +221,9 @@ async def full_plan(req: PlanRequest):
                 communication=result.communicator.communication,
                 comm_type=result.communicator.comm_type,
             ),
+            math_audit=MathAuditResponse(
+                **result.math_audit.to_dict()
+            ) if result.math_audit else None,
             latency_ms=result.latency_ms,
             total_ms=result.total_ms,
         )
@@ -277,13 +290,8 @@ async def communicate_only(request: Request):
         raise HTTPException(503, "Pipeline not ready")
 
     body = await request.json()
-    # Support two calling conventions:
-    # 1. Full pipeline: {"request": "<comm type>", "project_request": "<project desc>"}
-    # 2. Context-only:  {"request": "<project desc>", "comm_request": "...", "context": {...}}
-    project_request = body.get("project_request", "")
-    pm_request  = project_request or body.get("request", "")
-    comm_request = (body.get("request") if project_request else
-                    body.get("comm_request", "Write a professional project status update for stakeholders."))
+    pm_request  = body.get("request", "")
+    comm_request = body.get("comm_request", "Write a status update for stakeholders.")
     context     = body.get("context", {})
 
     if not pm_request:
@@ -335,6 +343,7 @@ if __name__ == "__main__":
 ║  Host:    {host:<31}║
 ║  Port:    {str(port):<31}║
 ║  Docs:    http://{host}:{port}/docs       ║
+║  Live:    http://{host}:{port}/live-docs  ║
 ╚══════════════════════════════════════════╝
     """)
 

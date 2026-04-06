@@ -21,6 +21,7 @@ import os
 import json
 import time
 import re
+from pmcore.math_validator import validate as math_validate, MathAudit
 import torch
 import torch.nn.functional as F
 from pathlib import Path
@@ -38,27 +39,19 @@ from pmcore.model import (
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-CHECKPOINT_DIR      = Path("./checkpoints")
-PHI3_CHECKPOINT_DIR = Path("./checkpoints/communicator_phi3/merged")
-TOKENIZER_PATH      = "/home/snavazio/autoresearch-v2/pm-model"
-TOKENIZER_HF        = "hf-internal-testing/llama-tokenizer"
+CHECKPOINT_DIR = Path("./checkpoints")
+TOKENIZER_PATH = "/home/snavazio/autoresearch-v2/pm-model"
+TOKENIZER_HF   = "hf-internal-testing/llama-tokenizer"
 
 SPECIAL_TOKENS = [
     "<|pm_request|>",
+    "<|response|>",
     "<|task_graph|>",
     "<|analysis|>",
     "<|communication|>",
     "<|project_context|>",
     "<|end|>",
 ]
-
-# System prompt used during Phi-3.5 LoRA fine-tuning — must match exactly
-PHI3_SYSTEM_PROMPT = (
-    "You are PMCommunicator, an expert project manager and communications specialist. "
-    "Generate professional, stakeholder-ready project communications based on the provided "
-    "project context. Be specific — use the actual project name, numbers, and timeline. "
-    "Write in clear business English. Output only the communication document itself."
-)
 
 # ── Generation Config ─────────────────────────────────────────────────────────
 
@@ -93,11 +86,11 @@ def generate(
 
     with torch.no_grad():
         for step in range(config.max_new_tokens):
-            # Always pass full sequence — KV-cache shortcut is broken because
-            # RoPE uses T (current input length) for positions, so single-token
-            # steps always get position 0 instead of their actual position.
-            # Full-sequence recompute is correct and fast enough for our sizes.
-            logits, _ = model(generated)
+            if step == 0:
+                logits, past_kvs = model(generated)
+            else:
+                last_token = generated[:, -1:]
+                logits, past_kvs = model(last_token, past_kvs=past_kvs)
 
             next_logits = logits[:, -1, :]
 
@@ -146,25 +139,7 @@ def generate(
             if tokenizer.eos_token_id and tid == tokenizer.eos_token_id:
                 break
 
-            # Loop detection — stop if any single token repeats 4+ times in
-            # the last 12 tokens, or any bigram repeats 3+ times in the last 12.
-            if len(new_tokens) >= 12:
-                window = new_tokens[-12:]
-                # Single-token run
-                if any(window.count(t) >= 4 for t in set(window)):
-                    break
-                # Bigram repetition
-                bigrams = [(window[i], window[i+1]) for i in range(len(window)-1)]
-                if any(bigrams.count(bg) >= 3 for bg in set(bigrams)):
-                    break
-
-    raw = tokenizer.decode(new_tokens, skip_special_tokens=False)
-    # Strip any trailing garbage after loop-detection cutoff — find last sentence end
-    for end_char in ('\n\n', '.\n', '. ', '!\n', '?\n'):
-        idx = raw.rfind(end_char)
-        if idx > len(raw) // 3:   # at least past the first third
-            return raw[:idx + len(end_char)]
-    return raw
+    return tokenizer.decode(new_tokens, skip_special_tokens=False)
 
 
 # ── Model Loader ──────────────────────────────────────────────────────────────
@@ -177,32 +152,6 @@ class ModelLoader:
         self.dtype  = torch.bfloat16
         self._models = {}
         self._tokenizer = None
-        self._phi3_model = None
-        self._phi3_tokenizer = None
-
-    def has_phi3_communicator(self) -> bool:
-        """True if the merged Phi-3.5 communicator checkpoint is present."""
-        return (PHI3_CHECKPOINT_DIR / "config.json").exists()
-
-    def load_phi3_communicator(self):
-        """Load (and cache) the fine-tuned Phi-3.5 communicator model."""
-        if self._phi3_model is not None:
-            return self._phi3_model, self._phi3_tokenizer
-
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        print(f"  Loading Phi-3.5 communicator from {PHI3_CHECKPOINT_DIR}...")
-        t0 = time.time()
-        self._phi3_tokenizer = AutoTokenizer.from_pretrained(str(PHI3_CHECKPOINT_DIR))
-        self._phi3_model = AutoModelForCausalLM.from_pretrained(
-            str(PHI3_CHECKPOINT_DIR),
-            torch_dtype=self.dtype,
-            attn_implementation="eager",
-        ).to(self.device)
-        self._phi3_model.eval()
-        elapsed = time.time() - t0
-        params  = sum(p.numel() for p in self._phi3_model.parameters())
-        print(f"  Phi-3.5 communicator loaded in {elapsed:.1f}s ({params/1e9:.2f}B params)")
-        return self._phi3_model, self._phi3_tokenizer
 
     def get_tokenizer(self):
         if self._tokenizer is None:
@@ -263,12 +212,8 @@ class ModelLoader:
 
     def load_all(self):
         self.get_tokenizer()
-        self.load_model("planner")
-        self.load_model("reasoner")
-        if self.has_phi3_communicator():
-            self.load_phi3_communicator()
-        else:
-            self.load_model("communicator")
+        for comp in ["planner", "reasoner", "communicator"]:
+            self.load_model(comp)
         return self
 
 
@@ -302,6 +247,7 @@ class PMCoreResult:
     planner:      PlannerResult
     reasoner:     ReasonerResult
     communicator: CommunicatorResult
+    math_audit:   Optional[MathAudit]
     latency_ms:   dict
     total_ms:     float
 
@@ -451,60 +397,14 @@ def extract_entities_from_text(text: str) -> dict:
     return entities
 
 
-def derive_project_name(request: str) -> str:
-    """Extract a meaningful project name from a free-text request string."""
-    r = request.strip()
-
-    # Pattern 1: verb + explicit object — "Plan a hotel lobby renovation"
-    m = re.search(
-        r'(?:plan|design|build|develop|deliver|execute|manage|complete|implement|perform|create|initiate)\s+'
-        r'(?:a\s+|an\s+|the\s+)?([A-Za-z][A-Za-z0-9 &\'\-]{4,70}?)(?:\.|,|with\s|for\s|\n|$|\Z)',
-        r, re.IGNORECASE
-    )
-    if m:
-        cand = m.group(1).strip().title()
-        if cand.lower() not in ("project", "plan", "work", "it", "this"):
-            return cand
-
-    # Pattern 2: explicit "<X> project/renovation/upgrade/etc." descriptor
-    m = re.search(
-        r'([A-Za-z][A-Za-z0-9 &\'\-]{3,60}'
-        r'(?:project|renovation|upgrade|build-out|expansion|retrofit|replacement|'
-        r'installation|implementation|overhaul|rollout|remodel|conversion|refresh|'
-        r'compliance|modernization|migration|deployment|integration))',
-        r, re.IGNORECASE
-    )
-    if m:
-        return m.group(1).strip().title()
-
-    # Pattern 3: "for a/the <noun phrase>"
-    m = re.search(r'for\s+(?:a\s+|an\s+|the\s+)?([A-Za-z][^.!?\n]{5,60}?)(?:\.|,|\n|$)', r, re.IGNORECASE)
-    if m:
-        cand = m.group(1).strip().title()
-        if cand.lower() not in ("project", "plan", "work"):
-            return cand
-
-    # Pattern 4: first noun phrase (drop leading imperative verbs/articles)
-    first_phrase = re.split(r'[.,!?\n]', r)[0].strip()
-    words = first_phrase.split()
-    drop = {"plan", "create", "build", "design", "develop", "execute", "manage",
-            "deliver", "implement", "do", "make", "complete", "run", "write",
-            "draft", "a", "an", "the", "please", "i", "we", "need", "to"}
-    while words and words[0].lower() in drop:
-        words = words[1:]
-    cand = " ".join(words[:7]).strip(". ,").title()
-    if len(cand) >= 6 and cand.lower() not in ("project", "plan", "work"):
-        return cand
-
-    return "Unnamed Project"
-
-
 def build_planner_json(request: str, entities: dict, raw_text: str) -> dict:
     """
     Build a minimal valid PMPlanner JSON from extracted entities
     when the model fails to output structured JSON.
     """
-    proj_name = derive_project_name(request)
+    # Derive project name from request
+    name_match = re.search(r'(?:plan|design|manage|build|develop|deliver)\s+(?:a\s+|an\s+)?(.{5,60}?)(?:\.|,|with|for|\n|$)', request, re.IGNORECASE)
+    proj_name = name_match.group(1).strip().title() if name_match else "Project"
 
     tasks = []
     if entities["tasks"]:
@@ -645,12 +545,6 @@ def parse_planner_output(raw: str, request: str = "") -> "PlannerResult":
         duration_days = sum(t.get("duration_days", 0) for t in graph["tasks"])
         graph["project"]["estimated_duration_days"] = duration_days
 
-    # Patch generic/missing project name — model sometimes outputs "Project" literally
-    proj_name = graph.get("project", {}).get("name", "")
-    if not proj_name or proj_name.strip().lower() in ("project", "unnamed project", "untitled", ""):
-        if request:
-            graph.setdefault("project", {})["name"] = derive_project_name(request)
-
     return PlannerResult(
         raw_output=cleaned,
         task_graph=graph,
@@ -696,70 +590,19 @@ def parse_reasoner_output(raw: str, request: str = "", planner: Optional["Planne
     )
 
 
-def _strip_placeholders(text: str) -> str:
-    """Remove common LLM placeholder patterns from generated prose."""
-    # Remove [Insert X], [X], {X} placeholders
-    text = re.sub(r'\[Insert [^\]]+\]', 'TBD', text)
-    text = re.sub(r'\[Your [^\]]+\]', 'TBD', text)
-    text = re.sub(r'\[Project [^\]]+\]', 'TBD', text)
-    text = re.sub(r'\[Name\]', 'Project Team', text)
-    text = re.sub(r'\[Date\]', '', text)
-    text = re.sub(r'\[XX\]', 'TBD', text)
-    # Clean up double spaces left behind
-    text = re.sub(r'  +', ' ', text)
-    return text.strip()
-
-
 def parse_communicator_output(raw: str) -> "CommunicatorResult":
-    cleaned = _strip_placeholders(clean_output(raw))
-    lower   = cleaned.lower()
+    cleaned = clean_output(raw)
 
-    # Extract first non-blank line (the document header) — most reliable signal
-    first_line = ""
-    for line in cleaned.splitlines():
-        if line.strip():
-            first_line = line.strip().lower()
-            break
-
-    # Priority order matters — check specific document headers first,
-    # then fall back to body-text signals.
     comm_type = "project_update"
-
-    # Closeout / handover — check BEFORE email (handover letters start with "Dear")
-    if any(k in first_line for k in ("closeout", "close-out", "handover letter",
-                                      "lessons learned", "project completion")):
-        comm_type = "closeout_report"
-    elif "handover letter" in lower or "formal handover" in lower:
-        comm_type = "closeout_report"
-
-    # Kickoff — subject line or explicit header
-    elif "kickoff" in first_line or "kick-off" in first_line:
-        comm_type = "kickoff_email"
-    elif "subject:" in lower and ("kickoff" in lower or "kick-off" in lower):
-        comm_type = "kickoff_email"
-
-    # Risk escalation — title must say escalation, not just mention risk
-    elif any(k in first_line for k in ("escalation", "risk escalation", "urgent:")):
-        comm_type = "risk_escalation"
-    elif "escalation memo" in lower or "risk escalation" in lower:
-        comm_type = "risk_escalation"
-
-    # Board / executive
-    elif any(k in first_line for k in ("board update", "board memo", "executive summary",
-                                        "governance update")):
-        comm_type = "executive_summary"
-    elif "executive summary" in lower or "board update" in lower:
-        comm_type = "executive_summary"
-
-    # Weekly status report
-    elif any(k in first_line for k in ("weekly status", "status report", "project status")):
-        comm_type = "status_report"
-    elif "status report" in lower or "weekly status" in lower:
-        comm_type = "status_report"
-
-    # Generic email (kickoff already caught above)
-    elif "subject:" in lower or (lower.startswith("dear ") and "subject" not in lower):
+    lower = cleaned.lower()
+    if "subject:" in lower or "dear " in lower:
         comm_type = "email"
+    elif "## weekly" in lower or "status report" in lower:
+        comm_type = "status_report"
+    elif "executive summary" in lower:
+        comm_type = "executive_summary"
+    elif "risk" in lower and "escalat" in lower:
+        comm_type = "risk_escalation"
 
     return CommunicatorResult(
         raw_output=cleaned,
@@ -853,40 +696,6 @@ class PMCorePipeline:
         result = parse_reasoner_output(raw, request, planner_result)
         return prompt, result
 
-    def _build_communicator_context(
-        self,
-        request: str,
-        planner_result: PlannerResult,
-        reasoner_result: ReasonerResult,
-    ) -> dict:
-        """Build the context dict shared by both communicator backends."""
-        proj      = (planner_result.task_graph or {}).get("project", {})
-        proj_name = proj.get("name", "") or derive_project_name(request)
-        budget    = proj.get("budget_usd", 0)
-        # If planner didn't extract a budget, try to parse one from the raw request
-        if not budget:
-            m = re.search(r'\$\s*(\d+(?:\.\d+)?)\s*(B|M|K)?', request, re.I)
-            if m:
-                val = float(m.group(1))
-                suffix = (m.group(2) or "").upper()
-                budget = int(val * {"B": 1_000_000_000, "M": 1_000_000, "K": 1_000}.get(suffix, 1))
-        ev        = (reasoner_result.risk_analysis or {}).get("earned_value", {})
-        return {
-            "project_name":         proj_name,
-            "project_summary":      request,
-            "methodology":          planner_result.methodology,
-            "duration_days":        planner_result.duration_days,
-            "budget_usd":           budget,
-            "health":               reasoner_result.overall_health.upper(),
-            "status":               "planning",
-            "pct_complete":         0,
-            "spi":                  ev.get("spi", 1.0),
-            "cpi":                  ev.get("cpi", 1.0),
-            "budget_spent_usd":     0,
-            "top_risks":            reasoner_result.top_risks,
-            "critical_path_phases": reasoner_result.critical_path,
-        }
-
     def _run_communicator(
         self,
         request: str,
@@ -894,107 +703,41 @@ class PMCorePipeline:
         reasoner_result: ReasonerResult,
         comm_request: str = "Write a project kickoff summary for stakeholders.",
     ) -> tuple[str, CommunicatorResult]:
-        """
-        Stage 3: Stakeholder-facing prose generation.
-        Prefers fine-tuned Phi-3.5 (checkpoints/communicator_phi3/merged/) when
-        available; falls back to the custom 672M PMCommunicator otherwise.
-        """
-        if self.loader.has_phi3_communicator():
-            return self._run_communicator_phi3(request, planner_result, reasoner_result, comm_request)
-        return self._run_communicator_custom(request, planner_result, reasoner_result, comm_request)
+        """Stage 3: Natural language output — no JSON prefix needed."""
+        tok   = self.loader.get_tokenizer()
+        model = self.loader.load_model("communicator")
 
-    def _run_communicator_phi3(
-        self,
-        request: str,
-        planner_result: PlannerResult,
-        reasoner_result: ReasonerResult,
-        comm_request: str,
-    ) -> tuple[str, CommunicatorResult]:
-        """Phi-3.5-mini fine-tuned communicator — high-quality prose via HF generate()."""
-        model, phi3_tok = self.loader.load_phi3_communicator()
-        context         = self._build_communicator_context(request, planner_result, reasoner_result)
-        context_str     = json.dumps(context, indent=2)
-
-        # Detect document type from comm_request to give model an explicit starter.
-        # This prevents defaulting to kickoff emails for all communication types.
-        _req_lower = comm_request.lower()
-        if any(k in _req_lower for k in ("closeout", "close-out", "handover", "lessons learned")):
-            doc_starter = "PROJECT CLOSEOUT REPORT\n"
-        elif any(k in _req_lower for k in ("escalat", "urgent")):
-            doc_starter = "RISK ESCALATION MEMO\n"
-        elif any(k in _req_lower for k in ("board", "executive summary", "governance")):
-            doc_starter = "EXECUTIVE SUMMARY\n"
-        elif any(k in _req_lower for k in ("status report", "weekly status", "progress update")):
-            doc_starter = "PROJECT STATUS REPORT\n"
-        elif any(k in _req_lower for k in ("kickoff", "kick-off", "launch announcement")):
-            doc_starter = "Subject: Project Kickoff —"
-        else:
-            doc_starter = ""   # let model decide
-
-        # Must match the chat template used during LoRA fine-tuning exactly
-        user_msg = f"{comm_request}\n\nProject Context:\n{context_str}"
-        prompt   = (
-            f"<|system|>\n{PHI3_SYSTEM_PROMPT}<|end|>\n"
-            f"<|user|>\n{user_msg}<|end|>\n"
-            f"<|assistant|>\n{doc_starter}"
+        health_emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(
+            reasoner_result.overall_health, "🟡"
         )
+        context = {
+            "project_summary":     request,
+            "num_tasks":           planner_result.num_tasks,
+            "methodology":         planner_result.methodology,
+            "duration_days":       planner_result.duration_days,
+            "health":              f"{health_emoji} {reasoner_result.overall_health.upper()}",
+            "top_risks":           reasoner_result.top_risks,
+            "critical_path_tasks": reasoner_result.critical_path,
+        }
 
-        input_ids = phi3_tok.encode(prompt, return_tensors="pt").to(
-            next(model.parameters()).device
-        )
-
-        with torch.no_grad():
-            output_ids = model.generate(
-                input_ids,
-                max_new_tokens=500,
-                min_new_tokens=60,
-                do_sample=True,
-                temperature=0.3,
-                top_p=0.92,
-                top_k=20,
-                repetition_penalty=1.1,
-                pad_token_id=phi3_tok.eos_token_id,
-                eos_token_id=phi3_tok.convert_tokens_to_ids("<|end|>"),
-            )
-
-        # Decode only the newly generated tokens
-        new_ids = output_ids[0][input_ids.shape[1]:]
-        raw     = phi3_tok.decode(new_ids, skip_special_tokens=True).strip()
-        result  = parse_communicator_output(raw)
-        return prompt, result
-
-    def _run_communicator_custom(
-        self,
-        request: str,
-        planner_result: PlannerResult,
-        reasoner_result: ReasonerResult,
-        comm_request: str,
-    ) -> tuple[str, CommunicatorResult]:
-        """Fallback: custom 672M PMCommunicator (from-scratch transformer)."""
-        tok     = self.loader.get_tokenizer()
-        model   = self.loader.load_model("communicator")
-        context = self._build_communicator_context(request, planner_result, reasoner_result)
-
-        # Prompt format matches communicator_clean_corpus.jsonl training data
         prompt = (
             f"<|pm_request|>\n{comm_request}\n"
             f"<|project_context|>\n{json.dumps(context, indent=2)}\n"
             f"<|response|>\n"
         )
 
-        end_token_id = tok.convert_tokens_to_ids("<|end|>")
         cfg = GenerationConfig(
-            max_new_tokens=500,
+            max_new_tokens=600,
             min_new_tokens=60,
-            temperature=0.3,
+            temperature=0.75,
             top_p=0.92,
-            top_k=20,
-            repetition_penalty=1.3,
+            top_k=50,
+            repetition_penalty=1.12,
         )
 
         input_ids = self._encode(prompt)
-        raw       = generate(model, input_ids, tok, cfg, stop_token_id=end_token_id)
-        result    = parse_communicator_output(raw)
+        raw = generate(model, input_ids, tok, cfg)
+        result = parse_communicator_output(raw)
         return prompt, result
 
     def run(
@@ -1044,11 +787,30 @@ class PMCorePipeline:
         _, comm_result = self._run_communicator(request, planner_result, reasoner_result, comm_request)
         latency["communicator_ms"] = round((time.time() - t0) * 1000)
 
-        latency["total_ms"] = round((time.time() - t_total) * 1000)
-
         if verbose:
             print(f"  Type: {comm_result.comm_type}")
             print(f"  Latency: {latency['communicator_ms']}ms")
+
+        # ── Stage 4: PMMath ───────────────────────────────────────────
+        if verbose: print(f"\n[Stage 4: PMMath — validating numbers...]")
+        t0 = time.time()
+        math_audit = math_validate(
+            planner_result,
+            reasoner_result,
+            comm_text=comm_result.communication,
+        )
+        latency["math_ms"] = round((time.time() - t0) * 1000)
+
+        if verbose:
+            icon = {"pass": "✓", "warn": "⚠", "fail": "✗"}.get(math_audit.overall, "?")
+            print(f"  {icon} {math_audit.overall.upper()}: {math_audit.summary[:120]}")
+            if math_audit.corrections:
+                print(f"  Corrections: {math_audit.corrections}")
+            print(f"  Latency: {latency['math_ms']}ms")
+
+        latency["total_ms"] = round((time.time() - t_total) * 1000)
+
+        if verbose:
             print(f"\nTotal pipeline latency: {latency['total_ms']}ms")
             print(f"\n{'='*60}")
             print("COMMUNICATION OUTPUT:")
@@ -1061,6 +823,7 @@ class PMCorePipeline:
             planner=planner_result,
             reasoner=reasoner_result,
             communicator=comm_result,
+            math_audit=math_audit,
             latency_ms=latency,
             total_ms=latency["total_ms"],
         )
