@@ -1,0 +1,321 @@
+/* PMCore WordPress Plugin — Styles
+ * Theme-compatible: uses WP custom properties and inherits fonts/colors.
+ * Only defines layout, spacing, and component-specific chrome.
+ */
+
+/* ── Wrapper ─────────────────────────────────────────────────────────────── */
+
+.pmcore-wrap {
+  max-width: 960px;
+  margin: 0 auto;
+  font-family: inherit;
+}
+
+/* ── Form ────────────────────────────────────────────────────────────────── */
+
+.pmcore-form {
+  margin-bottom: 2rem;
+}
+
+.pmcore-field {
+  margin-bottom: 1.25rem;
+}
+
+.pmcore-label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 0.4rem;
+  font-size: 0.95rem;
+}
+
+.pmcore-textarea {
+  width: 100%;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid;
+  border-color: var(--wp--preset--color--contrast, #8c8f94);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 0.95rem;
+  resize: vertical;
+  box-sizing: border-box;
+  background: var(--wp--preset--color--base, #fff);
+  color: inherit;
+}
+
+.pmcore-textarea:focus,
+.pmcore-select:focus {
+  outline: 2px solid var(--wp--preset--color--primary, #007cba);
+  outline-offset: 0;
+}
+
+.pmcore-select {
+  display: block;
+  width: 100%;
+  padding: 0.5rem 0.8rem;
+  border: 1px solid;
+  border-color: var(--wp--preset--color--contrast, #8c8f94);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 0.95rem;
+  background: var(--wp--preset--color--base, #fff);
+  color: inherit;
+  box-sizing: border-box;
+}
+
+.pmcore-submit-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+/* Primary button — falls through to theme's .wp-element-button if present */
+.pmcore-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.55rem 1.4rem;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: opacity 0.15s;
+}
+
+.pmcore-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Spinner (CSS-only) */
+.pmcore-spinner {
+  display: inline-block;
+  width: 1rem;
+  height: 1rem;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: pmcore-spin 0.7s linear infinite;
+  vertical-align: middle;
+}
+
+@keyframes pmcore-spin {
+  to { transform: rotate(360deg); }
+}
+
+.pmcore-status {
+  font-size: 0.9rem;
+  opacity: 0.75;
+  font-style: italic;
+}
+
+/* ── Error box ───────────────────────────────────────────────────────────── */
+
+.pmcore-error {
+  padding: 0.75rem 1rem;
+  border-left: 4px solid #d63638;
+  background: #fef0f0;
+  color: #d63638;
+  border-radius: 0 4px 4px 0;
+  margin-top: 1rem;
+  font-size: 0.95rem;
+}
+
+/* ── Results grid ────────────────────────────────────────────────────────── */
+
+.pmcore-results-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+@media (max-width: 640px) {
+  .pmcore-results-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── Section card ────────────────────────────────────────────────────────── */
+
+.pmcore-section {
+  border: 1px solid;
+  border-color: var(--wp--preset--color--contrast-2, #ddd);
+  border-radius: 6px;
+  padding: 1rem 1.25rem;
+  background: var(--wp--preset--color--base, #fff);
+  margin-bottom: 1rem;
+}
+
+.pmcore-section--wide {
+  /* Full width sections (communicator, audit) */
+}
+
+.pmcore-section-title {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+/* ── Badges ──────────────────────────────────────────────────────────────── */
+
+.pmcore-badge {
+  display: inline-block;
+  padding: 0.2em 0.55em;
+  border-radius: 3px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  line-height: 1.4;
+}
+
+.pmcore-badge--pass    { background: #d1fae5; color: #065f46; }
+.pmcore-badge--warn    { background: #fef3c7; color: #92400e; }
+.pmcore-badge--fail    { background: #fee2e2; color: #991b1b; }
+.pmcore-badge--skip    { background: #f3f4f6; color: #6b7280; }
+.pmcore-badge--neutral { background: #e0e7ff; color: #3730a3; }
+
+/* ── Planner ─────────────────────────────────────────────────────────────── */
+
+.pmcore-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+.pmcore-meta {
+  font-size: 0.9rem;
+  opacity: 0.8;
+}
+
+.pmcore-task-list {
+  margin: 0.5rem 0 0;
+  padding-left: 1.2rem;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.pmcore-task-list .pmcore-more {
+  opacity: 0.6;
+  font-style: italic;
+}
+
+/* ── Reasoner ────────────────────────────────────────────────────────────── */
+
+.pmcore-label-sm {
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.6;
+  margin: 0.75rem 0 0.25rem;
+}
+
+.pmcore-risk-list {
+  margin: 0;
+  padding-left: 1.2rem;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.pmcore-critical-path {
+  font-size: 0.88rem;
+  opacity: 0.85;
+  line-height: 1.6;
+}
+
+/* ── Communicator ────────────────────────────────────────────────────────── */
+
+.pmcore-comm-label {
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.6;
+  margin-bottom: 0.5rem;
+}
+
+.pmcore-prose-text {
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: 0.93rem;
+  line-height: 1.7;
+  margin: 0;
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 0.25rem 0;
+}
+
+.pmcore-copy-btn {
+  font-size: 0.78rem;
+  padding: 0.2em 0.7em;
+  cursor: pointer;
+  border-radius: 3px;
+  border: 1px solid;
+  border-color: var(--wp--preset--color--contrast, #8c8f94);
+  background: transparent;
+  color: inherit;
+  font-weight: 600;
+  transition: background 0.15s;
+}
+
+.pmcore-copy-btn:hover {
+  background: var(--wp--preset--color--contrast-2, #f0f0f0);
+}
+
+/* ── Math Audit ──────────────────────────────────────────────────────────── */
+
+.pmcore-audit-summary {
+  font-size: 0.9rem;
+  opacity: 0.85;
+  margin: 0.5rem 0 0.75rem;
+  line-height: 1.5;
+}
+
+.pmcore-audit-checks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.pmcore-audit-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.pmcore-audit-name {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pmcore-audit-msg {
+  opacity: 0.8;
+}
+
+.pmcore-corrections {
+  margin-top: 0.75rem;
+  padding: 0.6rem 0.8rem;
+  background: #fef3c7;
+  border-radius: 4px;
+  font-size: 0.88rem;
+}
+
+.pmcore-corrections ul {
+  margin: 0.35rem 0 0;
+  padding-left: 1.2rem;
+}
