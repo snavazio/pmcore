@@ -576,14 +576,15 @@ def parse_planner_output(raw: str, request: str = "") -> "PlannerResult":
         duration_days = sum(t.get("duration_days", 0) for t in graph["tasks"])
         graph["project"]["estimated_duration_days"] = duration_days
 
-    # Also extract the stated deadline from the original request (working days)
-    # so we can detect and fix over-budget task plans.
+    # Extract the stated deadline from the original request (working days)
+    # and enforce it: if the model produced tasks that overrun, scale them down.
     if request:
         stated = extract_entities_from_text(request).get("duration_days", 0)
-        if stated and stated < duration_days:
-            # Model produced tasks that exceed the stated deadline — clamp them.
+        if stated and duration_days and stated < duration_days:
+            # Model overran the stated deadline — rescale task durations.
             duration_days = stated
-            graph["project"]["estimated_duration_days"] = stated
+            proj = graph.setdefault("project", {})
+            proj["estimated_duration_days"] = stated
             tasks = graph.get("tasks", [])
             task_sum = sum(t.get("duration_days", 0) for t in tasks)
             if task_sum > 0:
@@ -597,6 +598,10 @@ def parse_planner_output(raw: str, request: str = "") -> "PlannerResult":
                     else:
                         # Last task absorbs rounding remainder
                         t["duration_days"] = max(1, stated - running)
+        elif stated and not duration_days:
+            # Model didn't set a duration at all — use the stated value
+            duration_days = stated
+            graph.setdefault("project", {})["estimated_duration_days"] = stated
 
     return PlannerResult(
         raw_output=cleaned,
@@ -689,14 +694,10 @@ class PMCorePipeline:
         tok   = self.loader.get_tokenizer()
         model = self.loader.load_model("planner")
 
-        # Normalise "X weeks" → "X weeks (N working days)" so the model
-        # receives an unambiguous day count.
-        normalised = normalise_duration_in_request(request)
-
         # Match exactly the format used during training:
         # <|pm_request|>\n{input}\n<|response|>\n{output}<|end|>
         prompt = (
-            f"<|pm_request|>\n{normalised}\n"
+            f"<|pm_request|>\n{request}\n"
             f"<|response|>\n"
         )
 
