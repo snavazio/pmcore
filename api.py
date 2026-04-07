@@ -139,6 +139,12 @@ class QuickPlanResponse(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+@app.get("/")
+async def root():
+    """Browser-friendly landing — confirms the API is alive."""
+    return {"message": "PMCore is available and waiting for your API request."}
+
+
 @app.get("/health")
 async def health():
     """Service health check."""
