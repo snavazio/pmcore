@@ -337,6 +337,32 @@ def repair_json(text: str) -> Optional[dict]:
     return None
 
 
+def normalise_duration_in_request(text: str) -> str:
+    """
+    Rewrite week/month mentions to explicit working-day counts before
+    the request is sent to the planner model.
+
+    Examples:
+      "8 week deadline"  -> "8-week (40 working days) deadline"
+      "3-month project"  -> "3-month (60 working days) project"
+    """
+    def replace_weeks(m):
+        n = int(m.group(1))
+        wd = n * 5
+        sep = m.group(2)  # the separator between number and "week"
+        return f"{n}{sep}week ({wd} working days)"
+
+    def replace_months(m):
+        n = int(m.group(1))
+        wd = n * 20
+        sep = m.group(2)
+        return f"{n}{sep}month ({wd} working days)"
+
+    text = re.sub(r'(\d+)([\s\-]*)week', replace_weeks, text, flags=re.IGNORECASE)
+    text = re.sub(r'(\d+)([\s\-]*)month', replace_months, text, flags=re.IGNORECASE)
+    return text
+
+
 def extract_entities_from_text(text: str) -> dict:
     """
     Last-resort extraction: pull structured values from hallucinated prose
@@ -360,9 +386,9 @@ def extract_entities_from_text(text: str) -> dict:
         val = int(dur_match.group(1))
         unit = dur_match.group(0).lower()
         if 'week' in unit or 'wk' in unit:
-            entities["duration_days"] = val * 7
+            entities["duration_days"] = val * 5   # 5 working days per week
         elif 'month' in unit:
-            entities["duration_days"] = val * 30
+            entities["duration_days"] = val * 20  # ~20 working days per month
         else:
             entities["duration_days"] = val
 
@@ -550,6 +576,28 @@ def parse_planner_output(raw: str, request: str = "") -> "PlannerResult":
         duration_days = sum(t.get("duration_days", 0) for t in graph["tasks"])
         graph["project"]["estimated_duration_days"] = duration_days
 
+    # Also extract the stated deadline from the original request (working days)
+    # so we can detect and fix over-budget task plans.
+    if request:
+        stated = extract_entities_from_text(request).get("duration_days", 0)
+        if stated and stated < duration_days:
+            # Model produced tasks that exceed the stated deadline — clamp them.
+            duration_days = stated
+            graph["project"]["estimated_duration_days"] = stated
+            tasks = graph.get("tasks", [])
+            task_sum = sum(t.get("duration_days", 0) for t in tasks)
+            if task_sum > 0:
+                scale = stated / task_sum
+                running = 0
+                for i, t in enumerate(tasks):
+                    if i < len(tasks) - 1:
+                        clamped = max(1, round(t.get("duration_days", 1) * scale))
+                        t["duration_days"] = clamped
+                        running += clamped
+                    else:
+                        # Last task absorbs rounding remainder
+                        t["duration_days"] = max(1, stated - running)
+
     return PlannerResult(
         raw_output=cleaned,
         task_graph=graph,
@@ -641,10 +689,14 @@ class PMCorePipeline:
         tok   = self.loader.get_tokenizer()
         model = self.loader.load_model("planner")
 
+        # Normalise "X weeks" → "X weeks (N working days)" so the model
+        # receives an unambiguous day count.
+        normalised = normalise_duration_in_request(request)
+
         # Match exactly the format used during training:
         # <|pm_request|>\n{input}\n<|response|>\n{output}<|end|>
         prompt = (
-            f"<|pm_request|>\n{request}\n"
+            f"<|pm_request|>\n{normalised}\n"
             f"<|response|>\n"
         )
 
