@@ -577,17 +577,19 @@ def parse_planner_output(raw: str, request: str = "") -> "PlannerResult":
         graph["project"]["estimated_duration_days"] = duration_days
 
     # Extract the stated deadline from the original request (working days)
-    # and enforce it: if the model produced tasks that overrun, scale them down.
+    # and enforce it: if task durations overrun, scale them down to fit.
     if request:
         stated = extract_entities_from_text(request).get("duration_days", 0)
-        if stated and duration_days and stated < duration_days:
-            # Model overran the stated deadline — rescale task durations.
-            duration_days = stated
-            proj = graph.setdefault("project", {})
-            proj["estimated_duration_days"] = stated
+        if stated:
+            # Always lock the project-level duration to the stated deadline
+            if not duration_days or duration_days != stated:
+                duration_days = stated
+                graph.setdefault("project", {})["estimated_duration_days"] = stated
+
+            # Clamp individual task durations if they sum over the deadline
             tasks = graph.get("tasks", [])
             task_sum = sum(t.get("duration_days", 0) for t in tasks)
-            if task_sum > 0:
+            if tasks and task_sum > stated:
                 scale = stated / task_sum
                 running = 0
                 for i, t in enumerate(tasks):
@@ -596,12 +598,7 @@ def parse_planner_output(raw: str, request: str = "") -> "PlannerResult":
                         t["duration_days"] = clamped
                         running += clamped
                     else:
-                        # Last task absorbs rounding remainder
                         t["duration_days"] = max(1, stated - running)
-        elif stated and not duration_days:
-            # Model didn't set a duration at all — use the stated value
-            duration_days = stated
-            graph.setdefault("project", {})["estimated_duration_days"] = stated
 
     return PlannerResult(
         raw_output=cleaned,
