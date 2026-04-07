@@ -708,12 +708,17 @@ class PMCorePipeline:
         reasoner_result: ReasonerResult,
         comm_request: str = "Write a project kickoff summary for stakeholders.",
     ) -> tuple[str, CommunicatorResult]:
-        """Stage 3: Natural language output — no JSON prefix needed."""
-        tok   = self.loader.get_tokenizer()
-        model = self.loader.load_model("communicator")
+        """Stage 3: Natural language output via Ollama (pmcommunicator model).
 
-        health_emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(
-            reasoner_result.overall_health, "🟡"
+        Calls the local Ollama REST API at http://localhost:11434 so the
+        Phi-3.5-mini LoRA handles prose generation instead of the from-scratch
+        communicator model (which was not trained for open-ended prose).
+        Falls back to the from-scratch model if Ollama is unavailable.
+        """
+        import urllib.request
+
+        health_emoji = {"green": "\U0001f7e2", "yellow": "\U0001f7e1", "red": "\U0001f534"}.get(
+            reasoner_result.overall_health, "\U0001f7e1"
         )
         context = {
             "project_summary":     request,
@@ -731,19 +736,50 @@ class PMCorePipeline:
             f"<|response|>\n"
         )
 
-        cfg = GenerationConfig(
-            max_new_tokens=600,
-            min_new_tokens=60,
-            temperature=0.75,
-            top_p=0.92,
-            top_k=50,
-            repetition_penalty=1.12,
-        )
+        ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
-        input_ids = self._encode(prompt)
-        raw = generate(model, input_ids, tok, cfg)
-        result = parse_communicator_output(raw)
-        return prompt, result
+        try:
+            payload = json.dumps({
+                "model":  "pmcommunicator",
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature":        0.3,
+                    "top_p":              0.9,
+                    "repeat_penalty":     1.1,
+                    "num_predict":        600,
+                },
+            }).encode()
+
+            req = urllib.request.Request(
+                f"{ollama_url}/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode())
+            raw = data.get("response", "").strip()
+            result = parse_communicator_output(raw)
+            return prompt, result
+
+        except Exception as e:
+            # Ollama unavailable — fall back to from-scratch model
+            print(f"  [PMCommunicator] Ollama unavailable ({e}), using from-scratch model.")
+            tok   = self.loader.get_tokenizer()
+            model = self.loader.load_model("communicator")
+            cfg = GenerationConfig(
+                max_new_tokens=600,
+                min_new_tokens=60,
+                temperature=0.75,
+                top_p=0.92,
+                top_k=50,
+                repetition_penalty=1.12,
+            )
+            input_ids = self._encode(prompt)
+            raw = generate(model, input_ids, tok, cfg)
+            result = parse_communicator_output(raw)
+            return prompt, result
 
     def run(
         self,
